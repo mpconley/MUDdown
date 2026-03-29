@@ -25,6 +25,14 @@ import Base from "../layouts/Base.astro";
 
     // ── Markdown-lite renderer (handles basic MUDdown for display) ──────
 
+    function escapeHtml(s: string): string {
+      return s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
     function renderMuddown(muddown: string): string {
       // Strip container block fences
       let text = muddown
@@ -49,7 +57,9 @@ import Base from "../layouts/Base.astro";
       }
 
       function inlineFormat(line: string): string {
-        return line
+        // Escape HTML first so only our generated markup is injected
+        const safe = escapeHtml(line);
+        return safe
           .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
           .replace(/\*([^*]+)\*/g, "<em>$1</em>")
           .replace(/`([^`]+)`/g, "<code>$1</code>")
@@ -102,7 +112,37 @@ import Base from "../layouts/Base.astro";
     function appendMessage(muddown: string, className: string) {
       const div = document.createElement("div");
       div.className = className;
+
+      // ARIA: group each block type with a descriptive label.
+      // Landmark/live-region roles (main, alert, log, dialog) are NOT used here
+      // because #game-output already has role="log" aria-live="polite" — nesting
+      // those roles would cause duplicate announcements or landmark violations.
+      const blockMatch = muddown.match(/^:::(\w[\w-]*)/m);
+      if (blockMatch) {
+        const blockLabels: Record<string, string> = {
+          room: "Room description",
+          system: "System message",
+          combat: "Combat update",
+          dialogue: "NPC dialogue",
+        };
+        const label = blockLabels[blockMatch[1]];
+        if (label) {
+          div.setAttribute("role", "group");
+          div.setAttribute("aria-label", label);
+        }
+      }
+
       div.innerHTML = renderMuddown(muddown);
+      output.appendChild(div);
+      requestAnimationFrame(() => {
+        output.scrollTop = output.scrollHeight;
+      });
+    }
+
+    function appendRawHtml(html: string, className: string) {
+      const div = document.createElement("div");
+      div.className = className;
+      div.innerHTML = html;
       output.appendChild(div);
       requestAnimationFrame(() => {
         output.scrollTop = output.scrollHeight;
@@ -186,7 +226,7 @@ import Base from "../layouts/Base.astro";
         if (!cmd) return;
         history.unshift(cmd);
         historyIndex = -1;
-        appendMessage(`<span style="color:var(--green)">&gt; ${cmd}</span>`, "input-echo");
+        appendRawHtml(`<span style="color:var(--green)">&gt; ${escapeHtml(cmd)}</span>`, "input-echo");
         sendCommand(cmd);
         input.value = "";
       } else if (e.key === "ArrowUp") {
