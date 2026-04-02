@@ -195,7 +195,7 @@ Tie MUD rooms to GPS coordinates. Walk through your real neighborhood described 
 - [x] DNS: point muddown.com to server
 - [x] TLS via Let's Encrypt
 - [x] nginx config: static site + WebSocket proxy to game server
-- [ ] CI/CD: GitHub Actions for build/test/deploy
+- [x] CI/CD: GitHub Actions for build/test/deploy
 - [x] Environment-based configuration (.env)
 
 ### Phase 4 — AI Integration
