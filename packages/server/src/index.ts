@@ -17,6 +17,7 @@ import {
   type OAuthConfig, type ProviderConfig,
 } from "./auth.js";
 import { handleGamesRoute } from "./games.js";
+import { runComplianceChecks } from "./compliance.js";
 import { fireHook, registerHook, createGreetingHook } from "./hooks.js";
 
 // ─── Player Session ──────────────────────────────────────────────────────────
@@ -1543,21 +1544,51 @@ function saveAllState(): void {
 // Auto-save timer
 const saveTimer = setInterval(saveAllState, SAVE_INTERVAL_MS);
 
+// ─── Compliance Check Scheduler ──────────────────────────────────────────────
+
+const COMPLIANCE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const COMPLIANCE_INITIAL_DELAY_MS = 60 * 1000; // 1 minute after startup
+
+let activeComplianceRun: Promise<void> | null = null;
+
+function scheduleCompliance(label: string): void {
+  if (activeComplianceRun) return; // previous run still in progress
+  const startedAt = new Date().toISOString();
+  const run = runComplianceChecks(db)
+    .catch(err => console.error(`[${startedAt}] Compliance check (${label}) failed:`, err))
+    .finally(() => { if (activeComplianceRun === run) activeComplianceRun = null; });
+  activeComplianceRun = run;
+}
+
+const complianceInitialTimer = setTimeout(() => scheduleCompliance("startup run"), COMPLIANCE_INITIAL_DELAY_MS);
+complianceInitialTimer.unref();
+
+const complianceTimer = setInterval(() => scheduleCompliance("scheduled run"), COMPLIANCE_INTERVAL_MS);
+complianceTimer.unref();
+
 // ─── Graceful Shutdown ───────────────────────────────────────────────────────
 
-function shutdown(): void {
+async function shutdown(): Promise<void> {
   console.log("Shutting down — saving all state...");
   clearInterval(respawnTimer);
   clearInterval(saveTimer);
-  saveAllState();
-  db.cleanExpiredSessions();
+  clearTimeout(complianceInitialTimer);
+  clearInterval(complianceTimer);
 
-  // Force exit if shutdown hangs (e.g., lingering connections)
+  // Force exit if shutdown hangs (e.g., lingering connections or stuck compliance run)
   const forceExitTimer = setTimeout(() => {
     console.warn("Forced shutdown after timeout.");
     process.exit(1);
-  }, 5000);
+  }, 15_000);
   forceExitTimer.unref();
+
+  if (activeComplianceRun) {
+    console.log("Waiting for in-progress compliance check to finish...");
+    await activeComplianceRun;
+  }
+
+  saveAllState();
+  db.cleanExpiredSessions();
 
   // Close all WebSocket connections first
   for (const ws of wss.clients) {
