@@ -76,6 +76,31 @@ import Base from "../layouts/Base.astro";
       <div id="login-prompt" class="login-prompt" style="display:none;">
         <p>Want to add your server? <a href="/login">Log in</a> to register.</p>
       </div>
+
+      <div class="discord-widget-section">
+        <h3>Community</h3>
+        <p>Join the MUDdown Discord to find players, share your server, and chat with the community.</p>
+        <!-- Sandbox rationale:
+             allow-scripts: required for the Discord embed JS.
+             allow-same-origin: required so the widget can read discord.com cookies/storage
+               (without it the embed renders blank). Because the src is discord.com, the iframe
+               gets discord.com's origin — not muddown.com's — so it cannot access our cookies
+               or DOM. Theoretical risk: if the iframe navigated itself to a muddown.com URL it
+               would gain our origin; this is mitigated by Discord controlling the widget content.
+             allow-popups-to-escape-sandbox: required for Discord's join/login popup flow.
+             allow-forms: supports widget interactions that use form submission. -->
+        <iframe
+          src="https://discord.com/widget?id=1489973465221169213&theme=dark"
+          width="350"
+          height="500"
+          sandbox="allow-forms allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts"
+          title="MUDdown Discord server"
+          loading="lazy"
+        ></iframe>
+        <p class="discord-fallback">
+          Can't see the widget? <a href="https://discord.gg/mDFcMT3egK" target="_blank" rel="noopener noreferrer">Join the Discord directly</a>.
+        </p>
+      </div>
     </div>
   </section>
 
