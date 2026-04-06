@@ -577,3 +577,43 @@ export function buildHintContext(input: BuildHintContextInput): HintContext {
     maxHp: input.maxHp,
   };
 }
+
+/**
+ * Sanitize LLM-generated description text for safe injection into MUDdown.
+ * Collapses newlines to spaces, neutralizes container-block sequences,
+ * breaks scheme-based markdown links, and prevents a leading heading marker
+ * from being interpreted as a section/header when injected at line start.
+ */
+export function sanitizeRoomDescription(text: string): string {
+  const sanitized = text
+    .replace(/\r?\n/g, " ")
+    .replace(/:{3,}/g, (m) => "\u200b" + m)
+    .replace(/\]\((\w+):/g, "]\u200b($1:")
+    .trim();
+
+  return sanitized.replace(/^(#+)(\s)/, "\u200b$1$2");
+}
+
+/**
+ * Extract the narrative description paragraph from room MUDdown.
+ * This is the text between the `# Title` line and the first `## ` section header.
+ * Returns { text, startIdx, endIdx } or null if not found.
+ */
+export function extractNarrativeDescription(muddown: string): { text: string; startIdx: number; endIdx: number } | null {
+  // Find the title line
+  const titleMatch = muddown.match(/^# .+$/m);
+  if (!titleMatch || titleMatch.index === undefined) return null;
+
+  const afterTitle = titleMatch.index + titleMatch[0].length;
+
+  // Find the first ## section header after the title (handle CRLF)
+  const sectionRegex = /\r?\n## /;
+  const sectionResult = sectionRegex.exec(muddown.substring(afterTitle));
+  if (!sectionResult) return null;
+  const sectionMatch = afterTitle + sectionResult.index;
+
+  const text = muddown.substring(afterTitle, sectionMatch).trim();
+  if (!text) return null;
+
+  return { text, startIdx: afterTitle, endIdx: sectionMatch };
+}
