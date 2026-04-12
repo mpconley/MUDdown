@@ -18,8 +18,9 @@ Turborepo monorepo with npm workspaces:
 | `packages/bridge` | Future telnet bridge (empty) |
 | `apps/website` | Astro site: landing page, spec docs, playable web client |
 | `apps/mobile` | Expo React Native app for iOS/Android |
+| `apps/desktop` | Tauri v2 desktop app (macOS, Windows, Linux) |
 
-Dependency graph: `server` → `shared`; `parser` → `shared`; `client` → `shared`; `mobile` → `client`, `shared`; `website` → `spec` (reads Markdown at build time).
+Dependency graph: `server` → `shared`; `parser` → `shared`; `client` → `shared`; `mobile` → `client`, `shared`; `desktop` → `client`, `shared`; `website` → `spec` (reads Markdown at build time).
 
 ## TypeScript Conventions
 
@@ -166,6 +167,7 @@ Detailed how-to guides live in `.github/skills/<name>/SKILL.md` (canonical) with
 | `privacy` | Privacy compliance auditing (data collection, cookies, localStorage, policy alignment) |
 | `oauth-provider` | Add a new OAuth/OIDC identity provider (shared types, auth switches, server config, login button, env vars, tests) |
 | `mobile-testing` | Test the Expo React Native app on physical devices via Expo Go or iOS Simulator (LAN config, SDK alignment, entry point, simulators, OAuth) |
+| `desktop-app` | Build and maintain the Tauri v2 desktop app (scaffolding, Turborepo wiring, CI matrix, auto-updater signature verification, native integrations) |
 
 ### Maintaining Skills
 
