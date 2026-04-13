@@ -8,11 +8,15 @@
     "core:window:allow-set-title",
     "core:window:allow-show",
     "core:window:allow-set-focus",
+    "dialog:default",
+    "dialog:allow-ask",
     "notification:default",
     "notification:allow-notify",
     "notification:allow-is-permission-granted",
     "notification:allow-request-permission",
     "store:default",
-    "updater:default"
+    "updater:default",
+    "deep-link:default",
+    "opener:default"
   ]
 }

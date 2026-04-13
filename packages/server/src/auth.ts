@@ -4,6 +4,17 @@ import type { AccountRecord, CharacterRecord, OAuthProvider } from "@muddown/sha
 import { CHARACTER_CLASSES, CLASS_STATS, isCharacterClass, isOAuthProvider } from "@muddown/shared";
 import type { GameDatabase, AuthSession } from "./db/types.js";
 
+// ─── HTML Escaping ───────────────────────────────────────────────────────────
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 // ─── Exhaustiveness Guard ────────────────────────────────────────────────────
 
 function assertNever(x: never, context: string): never {
@@ -53,12 +64,37 @@ function secureCookieSuffix(config: OAuthConfig): string {
 
 // ─── OAuth State (CSRF protection) ──────────────────────────────────────────
 
-const pendingOAuth = new Map<string, { provider: OAuthProvider; createdAt: number; mobileRedirect?: string }>();
+const pendingOAuth = new Map<string, { provider: OAuthProvider; createdAt: number; mobileRedirect?: string; loginNonce?: string; loginOriginIp?: string }>();
+
+/**
+ * Native-app login security model:
+ *
+ * 1. The native client generates a random UUID (`loginNonce`) and passes it as
+ *    a query parameter when opening the browser for OAuth. The nonce must be
+ *    kept secret by the app — anyone who knows it can poll for the token.
+ * 2. After a successful OAuth callback the server stores the session token here
+ *    keyed by `loginNonce`, along with a `createdAt` timestamp and the
+ *    `originIp` of the request that initiated the login flow.
+ * 3. The native app polls `GET /auth/token-poll?nonce=<nonce>`. The server
+ *    verifies the poller's IP matches `originIp` (binding retrieval to the
+ *    initiating machine) and returns the token exactly once (one-time retrieval).
+ * 4. Entries expire after a 10-minute TTL via the cleanup interval below.
+ *
+ * Protections: nonce secrecy (client-generated UUID), IP binding (via
+ * `X-Forwarded-For` / `X-Real-IP` when behind a reverse proxy, falling back
+ * to `req.socket.remoteAddress` for direct connections), one-time retrieval,
+ * and short TTL. The client is responsible for generating, storing, and never
+ * leaking the nonce.
+ */
+const completedLogins = new Map<string, { token: string; createdAt: number; originIp?: string }>();
 
 setInterval(() => {
   const cutoff = Date.now() - 10 * 60 * 1000;
   for (const [key, val] of pendingOAuth) {
     if (val.createdAt < cutoff) pendingOAuth.delete(key);
+  }
+  for (const [key, val] of completedLogins) {
+    if (val.createdAt < cutoff) completedLogins.delete(key);
   }
 }, 5 * 60 * 1000).unref();
 
@@ -86,19 +122,34 @@ export function _insertTicket(ticket: string, characterId: string, expiresAt: nu
   wsTickets.set(ticket, { characterId, expiresAt });
 }
 
+/** @internal — exposed for unit tests only */
+export function _insertCompletedLogin(nonce: string, token: string, originIp?: string): void {
+  completedLogins.set(nonce, { token, createdAt: Date.now(), originIp });
+}
+
 // ─── CORS ────────────────────────────────────────────────────────────────────
 
-const WEBSITE_ORIGIN = process.env.WEBSITE_ORIGIN ?? "http://localhost:4321";
+const ALLOWED_ORIGINS: Set<string> = new Set(
+  (process.env.ALLOWED_ORIGINS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+);
+// Always allow the website origin and Tauri app origins
+ALLOWED_ORIGINS.add(process.env.WEBSITE_ORIGIN ?? "http://localhost:4321");
+ALLOWED_ORIGINS.add("tauri://localhost");        // macOS production
+ALLOWED_ORIGINS.add("https://tauri.localhost");  // Windows/Linux production
+if (process.env.NODE_ENV !== "production") {
+  ALLOWED_ORIGINS.add("http://localhost:1420");  // Tauri dev (Vite)
+}
 
 export function setCorsHeaders(req: IncomingMessage, res: ServerResponse): void {
   const origin = req.headers.origin;
-  if (origin === WEBSITE_ORIGIN) {
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Credentials", "true");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   } else if (origin) {
-    console.warn(`CORS: rejected origin "${origin}" (expected "${WEBSITE_ORIGIN}")`);
+    console.warn(`CORS: rejected origin "${origin}" (allowed: ${[...ALLOWED_ORIGINS].join(", ")})`);
   }
 }
 
@@ -110,6 +161,25 @@ export function handleCorsPreflightIfNeeded(req: IncomingMessage, res: ServerRes
     return true;
   }
   return false;
+}
+
+/**
+ * Resolve the client's IP address, preferring proxy headers over the raw socket.
+ * Trusts `X-Forwarded-For` (first entry) and `X-Real-IP` because the production
+ * nginx config (`deploy/nginx/muddown-proxy.conf`) sets both.
+ */
+function getClientIp(req: IncomingMessage): string | undefined {
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) {
+    const first = (Array.isArray(xff) ? xff[0] : xff).split(",")[0].trim();
+    if (first) return first;
+  }
+  const xri = req.headers["x-real-ip"];
+  if (xri) {
+    const val = Array.isArray(xri) ? xri[0] : xri;
+    if (val) return val.trim();
+  }
+  return req.socket.remoteAddress ?? undefined;
 }
 
 // ─── Route Handler ───────────────────────────────────────────────────────────
@@ -138,7 +208,7 @@ export async function handleAuthRoute(
   }
 
   if (url.pathname === "/auth/login" && req.method === "GET") {
-    handleLogin(url, res, config);
+    handleLogin(url, req, res, config);
     return true;
   }
 
@@ -177,7 +247,37 @@ export async function handleAuthRoute(
     return true;
   }
 
+  if (url.pathname === "/auth/token-poll" && req.method === "GET") {
+    handleTokenPoll(url, req, res);
+    return true;
+  }
+
   return false;
+}
+
+// ─── /auth/token-poll → poll for completed native-app login ─────────────────
+
+function handleTokenPoll(url: URL, req: IncomingMessage, res: ServerResponse): void {
+  const nonce = url.searchParams.get("nonce");
+  if (!nonce) {
+    sendJson(res, 400, { error: "Missing nonce parameter." });
+    return;
+  }
+  const entry = completedLogins.get(nonce);
+  if (!entry) {
+    sendJson(res, 202, { status: "pending" });
+    return;
+  }
+  // Verify the poller's IP matches the IP that initiated the login.
+  // This prevents a remote attacker from polling for a victim's token.
+  if (entry.originIp && getClientIp(req) !== entry.originIp) {
+    sendJson(res, 403, { error: "Forbidden." });
+    return;
+  }
+  // One-time retrieval — delete after successful poll
+  completedLogins.delete(nonce);
+  console.log(`[auth:token_retrieved] nonce=${nonce} pollerIp=${getClientIp(req) ?? "unknown"} originIp=${entry.originIp ?? "none"} at=${new Date().toISOString()}`);
+  sendJson(res, 200, { token: entry.token });
 }
 
 // ─── /auth/providers → list configured providers ────────────────────────────
@@ -191,7 +291,7 @@ function handleProviders(res: ServerResponse, config: OAuthConfig): void {
 
 // ─── /auth/login → redirect to OAuth provider ───────────────────────────────
 
-function handleLogin(url: URL, res: ServerResponse, config: OAuthConfig): void {
+function handleLogin(url: URL, req: IncomingMessage, res: ServerResponse, config: OAuthConfig): void {
   const providerParam = url.searchParams.get("provider") ?? "github";
 
   if (!isOAuthProvider(providerParam)) {
@@ -224,7 +324,14 @@ function handleLogin(url: URL, res: ServerResponse, config: OAuthConfig): void {
       return;
     }
   }
-  pendingOAuth.set(state, { provider, createdAt: Date.now(), mobileRedirect });
+  const loginNonce = url.searchParams.get("login_nonce") ?? undefined;
+  if (loginNonce && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(loginNonce)) {
+    res.writeHead(400, { "Content-Type": "text/plain" });
+    res.end("Invalid login_nonce format.");
+    return;
+  }
+  const loginOriginIp = loginNonce ? (getClientIp(req) ?? undefined) : undefined;
+  pendingOAuth.set(state, { provider, createdAt: Date.now(), mobileRedirect, loginNonce, loginOriginIp });
 
   const authorizeUrl = buildAuthorizeUrl(provider, providerCfg, state);
   res.writeHead(302, { Location: authorizeUrl });
@@ -347,19 +454,47 @@ async function handleCallback(
     const expiresAt = new Date(Date.now() + SESSION_DURATION_MS).toISOString();
     db.createSession({ token: sessionToken, accountId: account.id, activeCharacterId: null, expiresAt });
 
-    // Mobile clients pass a redirect_uri with a custom scheme (e.g. muddown://auth).
+    // Store completed login for polling (desktop/mobile apps poll /auth/token-poll)
+    if (pending.loginNonce) {
+      completedLogins.set(pending.loginNonce, { token: sessionToken, createdAt: Date.now(), originIp: pending.loginOriginIp });
+      console.log(`[handleCallback] Stored completed login for nonce ${pending.loginNonce.slice(0, 8)}… at=${new Date().toISOString()}`);
+    }
+
+    // Native app clients pass a redirect_uri with a custom scheme (e.g. muddown://auth).
     // Redirect back to the app with the session token as a query parameter so
     // the app can store it and use Bearer auth for subsequent API calls.
+    // We render an HTML relay page that attempts the deep link and shows feedback,
+    // because a raw 302 to a custom scheme fails in many browsers/OS configurations.
     if (pending.mobileRedirect) {
       try {
-        const mobileUrl = new URL(pending.mobileRedirect);
-        mobileUrl.searchParams.set("token", sessionToken);
-        res.writeHead(302, { Location: mobileUrl.toString() });
-        res.end();
+        const appUrl = new URL(pending.mobileRedirect);
+        appUrl.searchParams.set("token", sessionToken);
+        const deepLink = appUrl.toString();
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+        res.end(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MUDdown — Authenticated</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#0f1923;color:#c8d6e5;display:flex;
+       align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center}
+  .card{max-width:420px;padding:2rem;border:1px solid #2a3a4a;border-radius:12px;background:#162029}
+  h1{color:#00d2ff;font-size:1.5rem;margin:0 0 1rem}
+  p{line-height:1.6;margin:0.5rem 0}
+  a{color:#00d2ff;text-decoration:underline}
+  .dim{color:#6b8299;font-size:0.85rem}
+</style></head><body>
+<div class="card">
+  <h1>Authentication Successful</h1>
+  <p>Returning you to MUDdown…</p>
+  <p class="dim">If the app doesn't open automatically,
+     <a id="link" href="${escapeHtml(deepLink)}">click here</a>.</p>
+</div>
+<script>setTimeout(function(){window.location.href=${JSON.stringify(deepLink)};},300);</script>
+</body></html>`);
       } catch (urlErr) {
-        console.warn(`Malformed mobile redirect_uri: ${pending.mobileRedirect}`, urlErr);
+        console.warn(`Malformed app redirect_uri: ${pending.mobileRedirect}`, urlErr);
         res.writeHead(400, { "Content-Type": "text/plain" });
-        res.end("Invalid mobile redirect URI.");
+        res.end("Invalid app redirect URI.");
       }
       return;
     }
