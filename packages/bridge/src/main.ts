@@ -36,6 +36,7 @@ import { CHARACTER_CLASSES } from "@muddown/shared";
 import {
   TelnetParser,
   iacDo,
+  iacDont,
   iacWill,
   iacWont,
   iacNop,
@@ -259,10 +260,12 @@ export class TelnetSession {
   // ─── Telnet Negotiation ──────────────────────────────────────────────
 
   private negotiate(): void {
-    // Request NAWS, TTYPE, and offer ECHO + SGA
+    // Request NAWS, TTYPE, and offer SGA
+    // Note: we do NOT send WILL ECHO — Mudlet treats that as password-masking
+    // mode and shows asterisks instead of typed characters. The client handles
+    // local echo, so the bridge must not echo input back.
     this.write(iacDo(OPT_NAWS));
     this.write(iacDo(OPT_TTYPE));
-    this.write(iacWill(OPT_ECHO));
     this.write(iacWill(OPT_SGA));
 
     // Give client 1.5s to respond to negotiation before proceeding
@@ -335,8 +338,8 @@ export class TelnetSession {
         this.write(requestTtype());
         break;
       default:
-        // Reject unknown options
-        this.write(iacWont(option));
+        // Reject unknown options (DONT is the correct response to WILL)
+        this.write(iacDont(option));
         break;
     }
   }
@@ -351,9 +354,12 @@ export class TelnetSession {
 
   private handleDo(option: number): void {
     switch (option) {
-      case OPT_ECHO:
       case OPT_SGA:
-        // Client agrees to let us handle echo / suppress go-ahead
+        // Client agrees to suppress go-ahead
+        break;
+      case OPT_ECHO:
+        // We are NOT handling echo — client does local echo
+        this.write(iacWont(OPT_ECHO));
         break;
       default:
         this.write(iacWont(option));
@@ -399,8 +405,6 @@ export class TelnetSession {
       if (byte === 0x08 || byte === 0x7f) {
         if (this.inputBuffer.length > 0) {
           this.inputBuffer = this.inputBuffer.slice(0, -1);
-          // Erase character: backspace, space, backspace
-          this.write(Buffer.from([0x08, 0x20, 0x08]));
         }
         continue;
       }
@@ -413,8 +417,6 @@ export class TelnetSession {
           continue;
         }
         this.lastWasCR = byte === 0x0d;
-
-        this.write(Buffer.from("\r\n"));
 
         const line = this.inputBuffer;
         this.inputBuffer = "";
@@ -432,7 +434,6 @@ export class TelnetSession {
       // Printable ASCII
       if (byte >= 0x20 && byte < 0x7f) {
         this.inputBuffer += String.fromCharCode(byte);
-        this.write(Buffer.from([byte]));
       }
     }
   }
