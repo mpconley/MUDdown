@@ -17,7 +17,8 @@
 #   - Copy .env file to /opt/muddown/packages/server/.env
 #   - Point DNS (muddown.com) to the server IP
 #   - Run: certbot --nginx -d muddown.com -d www.muddown.com
-#   - Verify: systemctl status muddown-server
+#   - Grant cert access for bridge: chgrp -R muddown /etc/letsencrypt/{live,archive}
+#   - Verify: systemctl status muddown-server muddown-bridge
 
 set -euo pipefail
 
@@ -280,6 +281,26 @@ ENVEOF
   echo "    Created ${ENV_FILE} — edit with your secrets before starting."
 fi
 
+# Bridge .env template
+BRIDGE_ENV="${INSTALL_DIR}/packages/bridge/.env"
+if [[ ! -f "${BRIDGE_ENV}" ]]; then
+  mkdir -p "${INSTALL_DIR}/packages/bridge"
+  cat > "${BRIDGE_ENV}" <<'ENVEOF'
+# MUDdown Bridge Environment
+# TLS cert paths are populated after certbot runs.
+# Restart after editing: systemctl restart muddown-bridge
+
+BRIDGE_PORT=2323
+TELNET_TLS_CERT=/etc/letsencrypt/live/muddown.com/fullchain.pem
+TELNET_TLS_KEY=/etc/letsencrypt/live/muddown.com/privkey.pem
+GAME_SERVER_URL=ws://localhost:3300
+BRIDGE_SERVER_NAME=MUDdown
+ENVEOF
+  chown "${SERVICE_USER}:${SERVICE_USER}" "${BRIDGE_ENV}"
+  chmod 600 "${BRIDGE_ENV}"
+  echo "    Created ${BRIDGE_ENV}"
+fi
+
 # ── 12. Install systemd services ─────────────────────────────────────────────
 
 echo "==> Installing systemd services..."
@@ -377,6 +398,26 @@ fi
 mkdir -p "${INSTALL_DIR}/packages/server"
 chown "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}/packages/server"
 
+# ── 15. Certbot deploy hook for bridge TLS ────────────────────────────────────
+
+# After certbot obtains or renews certs, grant the service user read access
+# and restart the bridge so it picks up the new cert files.
+DEPLOY_HOOK_DIR="/etc/letsencrypt/renewal-hooks/deploy"
+DEPLOY_HOOK="${DEPLOY_HOOK_DIR}/muddown-bridge.sh"
+if [[ -f /etc/systemd/system/muddown-bridge.service ]]; then
+  mkdir -p "${DEPLOY_HOOK_DIR}"
+  cat > "${DEPLOY_HOOK}" <<HOOKEOF
+#!/usr/bin/env bash
+# Grant the muddown user read access to renewed certs
+chgrp -R ${SERVICE_USER} /etc/letsencrypt/live /etc/letsencrypt/archive
+chmod -R g+rX /etc/letsencrypt/live /etc/letsencrypt/archive
+# Restart bridge to pick up new certs
+systemctl restart muddown-bridge
+HOOKEOF
+  chmod 755 "${DEPLOY_HOOK}"
+  echo "    Installed certbot deploy hook: ${DEPLOY_HOOK}"
+fi
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 
 echo ""
@@ -400,6 +441,7 @@ SERVER_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || curl -s --max-time 5
 echo ""
 echo "  Point DNS:         muddown.com → ${SERVER_IP}"
 echo "  Enable TLS:        certbot --nginx -d muddown.com -d www.muddown.com"
+echo "  Grant certs:       chgrp -R ${SERVICE_USER} /etc/letsencrypt/{live,archive} && chmod -R g+rX /etc/letsencrypt/{live,archive}"
 echo ""
 if [[ "${SSH_PORT}" != "22" ]]; then
   echo "  SSH port changed to ${SSH_PORT}. Reconnect with:"
