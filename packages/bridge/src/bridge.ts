@@ -1335,7 +1335,14 @@ export class TelnetSession {
     this.sessionToken = sessionToken;
     this.writeLine("\r\nLogged in! Selecting character...\r\n");
 
-    return this.handleCharacterSelection(httpBase, sessionToken, mode);
+    const selectionResult = await this.handleCharacterSelection(httpBase, sessionToken, mode);
+    if (!selectionResult) {
+      // Clear auth state so a subsequent guest-play choice on the next
+      // menu iteration can't inherit this session token via onReconnecting.
+      this.sessionToken = undefined;
+      this.wsTicket = undefined;
+    }
+    return selectionResult;
   }
 
   /**
@@ -1430,7 +1437,10 @@ export class TelnetSession {
   private async handleCharacterCreation(httpBase: string, sessionToken: string): Promise<boolean> {
     const name = await this.prompt("Character name (or 'back'): ");
     if (name.trim().toLowerCase() === "back") {
-      // Explicit back — return to the main menu without an error message.
+      // User typed 'back' — let them know we heard it before returning.
+      // Also covers the edge case where someone wanted "Back" as a name:
+      // they'll see this message and can try again with a different name.
+      this.writeLine("Returning to main menu.\r\n");
       return false;
     }
     if (!name) {
@@ -1456,6 +1466,8 @@ export class TelnetSession {
 
     const classChoice = await this.prompt("Class [1] (or 'back'): ");
     if (classChoice.trim().toLowerCase() === "back") {
+      // User typed 'back' — bubble to runStartupMenu without an error message.
+      this.writeLine("Returning to main menu.\r\n");
       return false;
     }
     const cidx = classChoice === "" ? 1 : parseInt(classChoice, 10);
