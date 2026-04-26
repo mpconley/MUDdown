@@ -918,62 +918,78 @@ export class TelnetSession {
   /**
    * Show the opening menu and dispatch on the user's choice. Runs after
    * telnet negotiation finishes and before the bridge connects to the game
-   * server. Falls back to guest play if login fails and the session is
-   * still active. Disposed sessions skip the fallback.
+   * server.
+   *
+   * Guest play is only entered when the user explicitly selects [3]; any
+   * other unsuccessful path (cancelled login, empty character name, …)
+   * re-shows the menu so the user can pick again. Bounded by
+   * `MAX_MENU_ATTEMPTS` so a stuck session can't loop indefinitely.
+   * Disposed sessions exit the loop immediately.
    */
   private async runStartupMenu(): Promise<void> {
-    if (this.disposed) return;
-    this.writeLine(getStartupMenu());
-
+    const MAX_MENU_ATTEMPTS = 5;
     let connected = false;
-    try {
-      const choice = await this.prompt("Choice [1]: ");
-      let idx = 1;
-      if (choice !== "") {
-        const parsed = /^\d+$/.test(choice) ? parseInt(choice, 10) : NaN;
-        if (isNaN(parsed) || parsed < 1 || parsed > 3) {
-          this.writeLine("Invalid choice — logging in to an existing character.\r\n");
-        } else {
-          idx = parsed;
-        }
-      }
+    let attempts = 0;
 
-      if (idx === 2) {
-        this.loginInProgress = true;
-        try {
-          connected = await this.handleLogin("create");
-        } finally {
-          this.loginInProgress = false;
+    while (!connected && !this.disposed && attempts < MAX_MENU_ATTEMPTS) {
+      attempts++;
+
+      try {
+        // Inside try so a synchronous writeLine failure (very unlikely
+        // — writeLine no-ops on disposed/non-writable sockets) still
+        // hits the finally that clears promptHandler/promptReject
+        // rather than leaving a stale handler from a prior iteration.
+        this.writeLine(getStartupMenu());
+        const choice = await this.prompt("Choice [1]: ");
+        let idx = 1;
+        if (choice !== "") {
+          const parsed = /^\d+$/.test(choice) ? parseInt(choice, 10) : NaN;
+          if (isNaN(parsed) || parsed < 1 || parsed > 3) {
+            this.writeLine("Invalid choice — logging in to an existing character.\r\n");
+          } else {
+            idx = parsed;
+          }
         }
-      } else if (idx === 3) {
-        this.writeLine("\r\nPlaying as a guest.\r\n");
-        this.connectToGame();
-        connected = true;
-      } else {
-        this.loginInProgress = true;
-        try {
-          connected = await this.handleLogin("existing");
-        } finally {
-          this.loginInProgress = false;
+
+        if (idx === 2) {
+          this.loginInProgress = true;
+          try {
+            connected = await this.handleLogin("create");
+          } finally {
+            this.loginInProgress = false;
+          }
+        } else if (idx === 3) {
+          this.writeLine("\r\nPlaying as a guest.\r\n");
+          this.connectToGame();
+          connected = true;
+        } else {
+          this.loginInProgress = true;
+          try {
+            connected = await this.handleLogin("existing");
+          } finally {
+            this.loginInProgress = false;
+          }
         }
+      } catch (err) {
+        if (err instanceof SessionDisposedError) {
+          // Normal disconnect mid-prompt — not an error worth logging.
+          return;
+        }
+        console.error(`[bridge] [${this.id}] startup menu error:`, err);
+        if (!this.disposed) {
+          this.writeLine("\r\nAn error occurred during login. Please try again later.\r\n");
+        }
+      } finally {
+        this.promptHandler = null;
+        this.promptReject = null;
       }
-    } catch (err) {
-      if (err instanceof SessionDisposedError) {
-        // Normal disconnect mid-prompt — not an error worth logging.
-        return;
-      }
-      console.error(`[bridge] [${this.id}] startup menu error:`, err);
-      if (!this.disposed) {
-        this.writeLine("\r\nAn error occurred during login. Please try again later.\r\n");
-      }
-    } finally {
-      this.promptHandler = null;
-      this.promptReject = null;
     }
 
     if (!connected && !this.disposed) {
-      this.writeLine("\r\nFalling back to guest play. Type 'login' to try again.\r\n");
-      this.connectToGame();
+      this.writeLine(
+        `\r\nGiving up after ${MAX_MENU_ATTEMPTS} attempts. Disconnecting.\r\n`,
+      );
+      this.dispose();
     }
   }
 
@@ -1014,9 +1030,12 @@ export class TelnetSession {
    *
    * @param mode "existing" jumps into the character picker afterwards;
    *             "create" jumps straight into character creation.
-   * @returns true if OAuth completed and the bridge connected with an
-   *          auth ticket; false if any step failed, in which case the
-   *          caller should fall back to guest play.
+   * @returns true if a connection to the game server has been
+   *          established (either authenticated, or guest play after
+   *          the user explicitly typed `guest` at the retry prompt).
+   *          false means the login attempt did not connect; the caller
+   *          (`runStartupMenu`) re-shows the main menu rather than
+   *          falling back to guest play implicitly.
    */
   private async handleLogin(mode: "existing" | "create"): Promise<boolean> {
     const httpBase = wsToHttpBase(this.config.gameServerUrl);
@@ -1055,15 +1074,19 @@ export class TelnetSession {
       // OSC 8 click for the full 2-minute window) we disconnect
       // immediately because the user has effectively walked away.
       // All disconnect paths fire a best-effort login-cancel and
-      // dispose the session — the caller's guest fallback is gated on
-      // !this.disposed, so dispose-then-return-false skips it.
+      // dispose the session — dispose-then-return-false short-circuits
+      // the caller's retry loop in `runStartupMenu` (which is gated on
+      // !this.disposed) so the user doesn't see another menu over a
+      // dead socket.
       this.writeLine("\r\nLogin Provider:");
+      this.writeLine("");
       for (let i = 0; i < providers.length; i++) {
         const name = providers[i];
         const url = buildLoginUrl(publicBase, name, nonce);
         const label = displayProviderName(name);
         this.writeLine(`  [${i + 1}] ${buildOsc8Hyperlink(url, label, hyperlinkEnabled)}`);
       }
+      this.writeLine("");
 
       // Race the picker prompt against an opportunistic poll for the
       // shared nonce: if the user clicks any provider's OSC 8
@@ -1199,8 +1222,10 @@ export class TelnetSession {
       if (!firstAttempt) {
         this.writeLine("\r\nGenerating a new login URL — the previous one is no longer valid.");
       }
-      this.writeLine("\r\nOpen this URL in your browser to log in:\r\n");
-      this.writeLine(`  ${buildOsc8Hyperlink(loginUrl, loginUrl, hyperlinkEnabled)}\r\n`);
+      this.writeLine("\r\nOpen this URL in your browser to log in:");
+      this.writeLine("");
+      this.writeLine(`  ${buildOsc8Hyperlink(loginUrl, loginUrl, hyperlinkEnabled)}`);
+      this.writeLine("");
       this.writeLine("Waiting for login (up to 2 minutes)...");
       firstAttempt = false;
 
@@ -1236,11 +1261,25 @@ export class TelnetSession {
         "Press enter to try again, or type 'guest' to play as a guest: ",
       );
       if (retry.trim().toLowerCase() === "guest") {
-        // User opted out — drop the unused server-side state before
-        // returning so the caller's guest fallback runs against a
-        // clean slate.
+        // User explicitly opted for guest play after a failed login.
+        // Drop the unused server-side state and connect as guest here.
+        // Clear any stale auth state on this session so a later
+        // reconnect can't accidentally promote the guest socket back
+        // into an authenticated one via a leftover sessionToken or
+        // wsTicket from before the user typed `guest`.
+        // The !this.disposed guard around connectToGame mirrors the
+        // pattern in runStartupMenu — if the socket closed between the
+        // retry prompt resolving and us getting here, connectToGame()
+        // would silently no-op and we'd return true over a dead
+        // session, leaving runStartupMenu's retry loop with no signal
+        // that the user is gone.
         this.cancelCurrentLoginNonce();
-        return false;
+        this.sessionToken = undefined;
+        this.wsTicket = undefined;
+        if (this.disposed) return false;
+        this.writeLine("\r\nPlaying as a guest.\r\n");
+        this.connectToGame();
+        return true;
       }
       // Anything else (including empty) → cancel the old nonce
       // server-side and regenerate so the user gets a fresh URL.
@@ -1262,7 +1301,9 @@ export class TelnetSession {
    *
    * @returns true if a character was selected/created AND a ws ticket was
    *          obtained AND `reconnectWithAuth` was called. false on any
-   *          failure — the caller is responsible for the guest fallback.
+   *          failure — the caller (`handleLogin` → `runStartupMenu`)
+   *          re-shows the main menu so the user can try again. Guest
+   *          play is never entered implicitly from this path.
    */
   private async handleCharacterSelection(
     httpBase: string,
@@ -1276,12 +1317,21 @@ export class TelnetSession {
       const characters = await fetchCharacters(httpBase, sessionToken);
 
       if (characters.length > 0) {
+        const sendLinks = this.capabilities.has("OSC_HYPERLINKS_SEND");
         this.writeLine("\r\nCharacters:");
+        this.writeLine("");
         for (let i = 0; i < characters.length; i++) {
           const ch = characters[i];
-          this.writeLine(`  [${i + 1}] ${ch.name} (${ch.characterClass})`);
+          const text = `  [${i + 1}] ${ch.name} (${ch.characterClass})`;
+          this.writeLine(
+            sendLinks ? buildOsc8Hyperlink(`send:${i + 1}`, text, true) : text,
+          );
         }
-        this.writeLine("  [0] Create a new character\r\n");
+        const newCharText = "  [0] Create a new character";
+        this.writeLine(
+          sendLinks ? buildOsc8Hyperlink("send:0", newCharText, true) : newCharText,
+        );
+        this.writeLine("");
 
         const pick = await this.prompt("Character [1]: ");
         const idx = pick === "" ? 1 : parseInt(pick, 10);
@@ -1332,17 +1382,27 @@ export class TelnetSession {
   private async handleCharacterCreation(httpBase: string, sessionToken: string): Promise<boolean> {
     const name = await this.prompt("Character name: ");
     if (!name) {
-      this.writeLine("Name cannot be empty.\r\n");
+      // Empty name aborts character creation. Don't fall through to
+      // guest — returning false bubbles up to runStartupMenu, which
+      // re-shows the menu so the user can pick again (or explicitly
+      // choose [3] guest).
+      this.writeLine("Character name cannot be empty. Returning to the menu.\r\n");
       return false;
     }
 
+    const sendLinks = this.capabilities.has("OSC_HYPERLINKS_SEND");
     this.writeLine("\r\nClass:");
+    this.writeLine("");
     for (let i = 0; i < CHARACTER_CLASSES.length; i++) {
       const cls = CHARACTER_CLASSES[i];
-      this.writeLine(`  [${i + 1}] ${cls.charAt(0).toUpperCase() + cls.slice(1)}`);
+      const label = `  [${i + 1}] ${cls.charAt(0).toUpperCase() + cls.slice(1)}`;
+      this.writeLine(
+        sendLinks ? buildOsc8Hyperlink(`send:${i + 1}`, label, true) : label,
+      );
     }
+    this.writeLine("");
 
-    const classChoice = await this.prompt("\r\nClass [1]: ");
+    const classChoice = await this.prompt("Class [1]: ");
     const cidx = classChoice === "" ? 1 : parseInt(classChoice, 10);
     let characterClass: typeof CHARACTER_CLASSES[number];
     if (!isNaN(cidx) && cidx >= 1 && cidx <= CHARACTER_CLASSES.length) {
